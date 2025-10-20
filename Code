@@ -1,0 +1,789 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch import nn
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torchvision import transforms
+import scipy.io as sio
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import glob
+import re
+from PIL import Image
+
+class Config:
+    motion_dir = r"C:\Users\Administrator\Desktop\DATA"
+    motion_files = glob.glob(os.path.join(motion_dir, "all_pitch.csv"))
+    wave_data_path = os.path.join(r"C:\Users\Administrator\Desktop\DATA", "wave.csv")
+    radar_dir = r"C:\Users\Administrator\Desktop\cropped_radar_images"
+
+    batch_size = 16
+    epochs = 500
+    lr = 1e-4
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sequence_length = 1200
+    print(device)
+    target_names = ['特征周期', '有义波高']
+
+    tp_loss_weight = 1.0
+    sh_loss_weight = 1.5
+
+class WaveDataset(Dataset):
+    def __init__(self, motion_data, wave_data, radar_files, transform=None):
+        self.motion_data = motion_data
+        self.wave_data = wave_data
+        self.radar_files = radar_files
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.motion_data)
+
+    def __getitem__(self, idx):
+        motion_sequence = self.motion_data[idx]
+        if len(motion_sequence.shape) > 1:
+            motion_sequence = motion_sequence.flatten()
+        wave = self.wave_data[idx]
+
+        try:
+            image = Image.open(self.radar_files[idx]).convert('L')
+
+            if self.transform:
+                image = self.transform(image)
+            
+        except Exception as e:
+            print(f"加载雷达图像 {self.radar_files[idx]} 失败: {e}")
+            image = torch.zeros((1, 224, 224), dtype=torch.float32)
+            if self.transform:
+                 image = self.transform(Image.new('L', (224, 224), 0))
+        
+        return image, motion_sequence, wave
+
+
+class MetricsCalculator:
+    @staticmethod
+    def calculate_metrics(true, pred, target_stats):
+        metrics = {}
+        epsilon = 1e-3
+
+        for i, name in enumerate(Config.target_names):
+            y_true = true[:, i].flatten()
+            y_pred = pred[:, i].flatten()
+
+            mean = target_stats[name]['mean']
+            std = target_stats[name]['std']
+            y_true_denorm = y_true * std + mean
+            y_pred_denorm = y_pred * std + mean
+
+            metrics[f'{name}_MAE'] = mean_absolute_error(y_true_denorm, y_pred_denorm)
+            metrics[f'{name}_RMSE'] = np.sqrt(mean_squared_error(y_true_denorm, y_pred_denorm))
+            metrics[f'{name}_R2'] = r2_score(y_true_denorm, y_pred_denorm)
+            absolute_error = np.abs(y_true_denorm - y_pred_denorm)
+            relative_error = absolute_error / (np.abs(y_true_denorm) + epsilon)
+            metrics[f'{name}_MRE'] = np.mean(relative_error)
+            metrics[f'{name}_MSE'] = mean_squared_error(y_true_denorm, y_pred_denorm)
+
+        all_true_denorm = []
+        all_pred_denorm = []
+        for i, name in enumerate(Config.target_names):
+            mean = target_stats[name]['mean']
+            std = target_stats[name]['std']
+            all_true_denorm.extend((true[:, i].flatten() * std + mean).tolist())
+            all_pred_denorm.extend((pred[:, i].flatten() * std + mean).tolist())
+
+        metrics['Overall_MAE'] = mean_absolute_error(all_true_denorm, all_pred_denorm)
+        metrics['Overall_RMSE'] = np.sqrt(mean_squared_error(all_true_denorm, all_pred_denorm))
+        metrics['Overall_R2'] = r2_score(all_true_denorm, all_pred_denorm)
+        overall_relative_error = np.abs(np.array(all_true_denorm) - np.array(all_pred_denorm)) / \
+                                 (np.abs(np.array(all_true_denorm)) + epsilon)
+        metrics['Overall_MRE'] = np.mean(overall_relative_error)
+        metrics['Overall_MSE'] = mean_squared_error(all_true_denorm, all_pred_denorm)
+
+        return metrics
+
+
+class WaveDataProcessor:
+    def __init__(self):
+        self.image_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+
+        self.target_stats = {
+            '特征周期': {'mean': None, 'std': None},
+            '有义波高': {'mean': None, 'std': None}
+        }
+        self.motion_mean = None
+        self.motion_std = None
+        self.radar_files = None
+
+    def load_data(self):
+        all_motion_data = []
+        
+        for motion_file in Config.motion_files:
+            try:
+                df = pd.read_csv(motion_file, header=None)
+                data = df.values.astype(np.float32)
+                valid_length = (len(data) // Config.sequence_length) * Config.sequence_length
+                if valid_length > 0:
+                    sequences = np.array_split(data[:valid_length], valid_length // Config.sequence_length)
+                    all_motion_data.extend(sequences)
+                    print(f"从文件 {os.path.basename(motion_file)} 加载了 {len(sequences)} 个序列")
+                else:
+                    print(f"文件 {os.path.basename(motion_file)} 的数据太短，无法形成完整序列")
+            except Exception as e:
+                print(f"加载文件 {os.path.basename(motion_file)} 失败: {e}")
+
+        motion_data = np.array(all_motion_data, dtype=np.float32)
+        print(f"时历数据形状: {motion_data.shape}")
+
+        wave_df = pd.read_csv(Config.wave_data_path, header=None)
+        wave_data = wave_df.values.astype(np.float32)
+
+        if len(wave_data) > len(motion_data):
+            wave_data = wave_data[:len(motion_data)]
+            print(f"截断波浪参数数据以匹配时历数据，剩余 {len(wave_data)} 个样本")
+        elif len(wave_data) < len(motion_data):
+            motion_data = motion_data[:len(wave_data)]
+            print(f"截断时历数据以匹配波浪参数数据，剩余 {len(motion_data)} 个样本")
+
+        self._calculate_stats(motion_data, wave_data)
+
+        motion_data_norm = np.zeros_like(motion_data)
+        for i in range(motion_data.shape[0]):
+            motion_data_norm[i] = (motion_data[i] - self.motion_mean) / (self.motion_std + 1e-8)
+
+        wave_data_norm = np.zeros_like(wave_data)
+        for i, name in enumerate(Config.target_names):
+            wave_data_norm[:, i] = (wave_data[:, i] - self.target_stats[name]['mean']) / (
+                        self.target_stats[name]['std'] + 1e-8)
+
+        self.radar_files = self._get_radar_files()
+
+        min_len = min(len(motion_data_norm), len(wave_data_norm), len(self.radar_files))
+        motion_data_norm = motion_data_norm[:min_len]
+        wave_data_norm = wave_data_norm[:min_len]
+        self.radar_files = self.radar_files[:min_len]
+
+        return motion_data_norm, wave_data_norm
+
+    def _calculate_stats(self, motion_data, wave_data):
+        self.motion_mean = np.mean(motion_data.reshape(-1))
+        self.motion_std = np.std(motion_data.reshape(-1))
+        
+        print(f"时历数据均值: {self.motion_mean}, 标准差: {self.motion_std}")
+
+        for i, name in enumerate(Config.target_names):
+            self.target_stats[name]['mean'] = np.mean(wave_data[:, i])
+            self.target_stats[name]['std'] = np.std(wave_data[:, i])
+            print(f"{name} 均值: {self.target_stats[name]['mean']}, 标准差: {self.target_stats[name]['std']}")
+
+    def _get_radar_files(self):
+        radar_files = glob.glob(os.path.join(Config.radar_dir, "radar_image_*_cropped.png"))
+
+        def extract_number(filename):
+            match = re.search(r'radar_image_(\d+)_cropped\.png', os.path.basename(filename))
+            return int(match.group(1)) if match else 0
+
+        radar_files = sorted(radar_files, key=extract_number)
+        print(f"找到 {len(radar_files)} 个雷达PNG图像")
+        return radar_files
+
+    def create_datasets(self, motion_data, wave_data):
+        assert len(motion_data) == len(wave_data) == len(self.radar_files), "数据长度不一致"
+
+        total_samples = len(motion_data)
+
+        train_size = int(0.7 * total_samples)
+        val_size = int(0.15 * total_samples)
+
+        train_indices = np.arange(train_size)
+        val_indices = np.arange(train_size, train_size + val_size)
+        test_indices = np.arange(train_size + val_size, total_samples)
+        
+        print(f"\n数据集划分信息:")
+        print(f"总样本数: {total_samples}")
+        print(f"训练集: {len(train_indices)} 样本 (70%)")
+        print(f"验证集: {len(val_indices)} 样本 (15%)")
+        print(f"测试集: {len(test_indices)} 样本 (15%)")
+
+        train_dataset = WaveDataset(
+            motion_data[train_indices],
+            wave_data[train_indices],
+            [self.radar_files[i] for i in train_indices],
+            self.image_transform
+        )
+
+        val_dataset = WaveDataset(
+            motion_data[val_indices],
+            wave_data[val_indices],
+            [self.radar_files[i] for i in val_indices],
+            self.image_transform
+        )
+
+        test_dataset = WaveDataset(
+            motion_data[test_indices],
+            wave_data[test_indices],
+            [self.radar_files[i] for i in test_indices],
+            self.image_transform
+        )
+
+        return train_dataset, val_dataset, test_dataset
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction_ratio),
+            nn.ReLU(),
+            nn.Linear(in_channels // reduction_ratio, in_channels)
+        )
+        
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x).view(x.size(0), -1))
+        max_out = self.fc(self.max_pool(x).view(x.size(0), -1))
+        out = avg_out + max_out
+        return torch.sigmoid(out).view(x.size(0), x.size(1), 1, 1)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2)
+        
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv(x)
+        return torch.sigmoid(x)
+
+class TemporalAttention(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+    def forward(self, lstm_output):
+        attention_weights = self.attention(lstm_output)  # (batch_size, seq_len, 1)
+        attention_weights = torch.softmax(attention_weights, dim=1)
+        context = torch.sum(attention_weights * lstm_output, dim=1)  # (batch_size, hidden_size)
+        return context
+
+class CrossModalAttention(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.query_conv = nn.Linear(feature_dim, feature_dim // 2)
+        self.key_conv = nn.Linear(feature_dim, feature_dim // 2)
+        self.value_conv = nn.Linear(feature_dim, feature_dim)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x, y):
+        batch_size = x.size(0)
+        
+        proj_query = self.query_conv(x)  # B x C/2
+        proj_key = self.key_conv(y)      # B x C/2
+
+        energy = torch.bmm(proj_query.unsqueeze(1), proj_key.unsqueeze(2))  # B x 1 x 1
+        attention = torch.sigmoid(energy)  # B x 1 x 1
+        
+        proj_value = self.value_conv(y).view(batch_size, -1)  # B x C
+
+        attention = attention.view(batch_size, 1)
+        
+        out = self.gamma * attention * proj_value + y
+        
+        return out
+
+class ProgressiveFusion(nn.Module):
+    def __init__(self, cnn_dim=256, lstm_dim=256):
+        super().__init__()
+
+        self.cnn_projection = nn.Sequential(
+            nn.Linear(cnn_dim, cnn_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        
+        self.lstm_projection = nn.Sequential(
+            nn.Linear(lstm_dim, lstm_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        self.fusion_1 = nn.Sequential(
+            nn.Linear(cnn_dim + lstm_dim, 384),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        self.cnn_attention = CrossModalAttention(cnn_dim)
+        self.lstm_attention = CrossModalAttention(lstm_dim)
+        
+        self.fusion_2 = nn.Sequential(
+            nn.Linear(384 + cnn_dim + lstm_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        self.fusion_3 = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        self.output = nn.Linear(128, 2)
+        
+    def forward(self, cnn_features, lstm_features):
+        cnn_proj = self.cnn_projection(cnn_features)
+        lstm_proj = self.lstm_projection(lstm_features)
+
+        concat_features = torch.cat([cnn_proj, lstm_proj], dim=1)
+        fusion_1_out = self.fusion_1(concat_features)
+
+        cnn_enhanced = self.cnn_attention(lstm_features, cnn_features)
+        lstm_enhanced = self.lstm_attention(cnn_features, lstm_features)
+
+        fusion_2_input = torch.cat([fusion_1_out, cnn_enhanced, lstm_enhanced], dim=1)
+        fusion_2_out = self.fusion_2(fusion_2_input)
+
+        fusion_3_out = self.fusion_3(fusion_2_out)
+
+        output = self.output(fusion_3_out)
+        
+        return output
+
+class WaveParameterModel(nn.Module):
+    def __init__(self, motion_data_dim=1200):
+        super().__init__()
+
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.ca1 = ChannelAttention(256)
+        self.sa1 = SpatialAttention()
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(256, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.ca2 = ChannelAttention(512)
+        self.sa2 = SpatialAttention()
+
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+
+        self.cnn_proj = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=128,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True
+        )
+
+        self.temporal_attention = TemporalAttention(256)  # 256是因为双向LSTM的hidden_size*2
+
+        self.lstm_proj = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Dropout(0.4)
+        )
+
+        self.fusion = ProgressiveFusion(cnn_dim=256, lstm_dim=256)
+
+    def forward(self, x_cnn, x_lstm):
+        x = self.conv1(x_cnn)
+        x = x * self.ca1(x)
+        x = x * self.sa1(x)
+        
+        x = self.conv2(x)
+        x = x * self.ca2(x)
+        x = x * self.sa2(x)
+        
+        x = self.conv3(x)
+        cnn_features = x.view(x.size(0), -1)
+        cnn_features = self.cnn_proj(cnn_features)
+
+        if x_lstm.dim() == 4:
+            batch_size, seq_len = x_lstm.shape[0], x_lstm.shape[1]
+            x_lstm = x_lstm.reshape(batch_size, seq_len, -1)
+        elif x_lstm.dim() == 2:
+            x_lstm = x_lstm.unsqueeze(-1)
+        
+        lstm_output, _ = self.lstm(x_lstm)
+        lstm_features = self.temporal_attention(lstm_output)
+        lstm_features = self.lstm_proj(lstm_features)
+
+        output = self.fusion(cnn_features, lstm_features)
+        
+        return output
+
+class Trainer:
+    def __init__(self, model, config, processor):
+        self.model = model.to(config.device)
+        self.config = config
+        self.criterion = nn.L1Loss(reduction='none')
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=5)
+
+        self.train_losses = []
+        self.val_losses = []
+        self.val_metrics = []
+        self.test_metrics = None
+        self.best_val_loss = float('inf')
+
+        self.processor = processor
+
+    def train_epoch(self, train_loader):
+        self.model.train()
+        total_loss = 0.0
+
+        print(f"开始训练: {len(train_loader)}个批次")
+        for i, (x_cnn, x_lstm, y) in enumerate(train_loader):
+            x_cnn = x_cnn.to(self.config.device)
+            x_lstm = x_lstm.to(self.config.device)
+            y = y.to(self.config.device)
+
+            self.optimizer.zero_grad()
+            outputs = self.model(x_cnn, x_lstm)
+
+            losses = self.criterion(outputs, y)
+            tp_loss = losses[:, 0].mean()
+            sh_loss = losses[:, 1].mean()
+            loss = self.config.tp_loss_weight * tp_loss + self.config.sh_loss_weight * sh_loss
+
+            loss.backward()
+
+            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+            if (i + 1) % 10 == 0 or (i + 1) == len(train_loader):
+                print(f"  批次: {i+1}/{len(train_loader)} | Loss: {loss.item():.6f}")
+
+        avg_loss = total_loss / len(train_loader)
+        self.train_losses.append(avg_loss)
+        return avg_loss
+
+    def evaluate(self, val_loader):
+        self.model.eval()
+        total_loss = 0.0
+        all_preds = []
+        all_targets = []
+
+        print(f"开始验证: {len(val_loader)}个批次")
+        with torch.no_grad():
+            for i, (x_cnn, x_lstm, y) in enumerate(val_loader):
+                x_cnn = x_cnn.to(self.config.device)
+                x_lstm = x_lstm.to(self.config.device)
+                y = y.to(self.config.device)
+
+                outputs = self.model(x_cnn, x_lstm)
+
+                losses = self.criterion(outputs, y)
+                tp_loss = losses[:, 0].mean()
+                sh_loss = losses[:, 1].mean()
+                loss = self.config.tp_loss_weight * tp_loss + self.config.sh_loss_weight * sh_loss
+                
+                total_loss += loss.item()
+
+                all_preds.append(outputs.cpu().numpy())
+                all_targets.append(y.cpu().numpy())
+                if (i + 1) % 10 == 0 or (i + 1) == len(val_loader):
+                    print(f"  验证批次: {i+1}/{len(val_loader)} | Loss: {loss.item():.6f}")
+
+        avg_loss = total_loss / len(val_loader)
+        self.val_losses.append(avg_loss)
+        all_preds = np.vstack(all_preds)
+        all_targets = np.vstack(all_targets)
+
+        metrics = MetricsCalculator.calculate_metrics(all_targets, all_preds, self.processor.target_stats)
+        self.val_metrics.append(metrics)
+
+        return avg_loss, metrics
+
+    def test(self, test_loader):
+        self.model.eval()
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for x_cnn, x_lstm, y in test_loader:
+                x_cnn = x_cnn.to(self.config.device)
+                x_lstm = x_lstm.to(self.config.device)
+                y = y.to(self.config.device)
+
+                outputs = self.model(x_cnn, x_lstm)
+
+                all_preds.append(outputs.cpu().numpy())
+                all_targets.append(y.cpu().numpy())
+
+        all_preds = np.vstack(all_preds)
+        all_targets = np.vstack(all_targets)
+
+        self.test_metrics = MetricsCalculator.calculate_metrics(all_targets, all_preds, self.processor.target_stats)
+        self._save_test_results(all_targets, all_preds)
+
+        print("\n测试集结果:")
+        for metric_name, metric_value in self.test_metrics.items():
+            print(f"{metric_name}: {metric_value:.4f}")
+
+        return self.test_metrics
+
+    def train(self, train_loader, val_loader, test_loader=None):
+        print("开始训练...")
+        patience = 20
+        no_improve = 0
+
+        import time
+        start_time = time.time()
+        total_epochs = self.config.epochs
+        epoch_times = []
+
+        print(f"\n{'='*50}")
+        print(f"训练配置:")
+        print(f"- 设备: {self.config.device}")
+        print(f"- 学习率: {self.config.lr}")
+        print(f"- 批次大小: {self.config.batch_size}")
+        print(f"- 总轮次: {self.config.epochs}")
+        print(f"- 训练样本数: {len(train_loader.dataset)}")
+        print(f"- 验证样本数: {len(val_loader.dataset)}")
+        if test_loader is not None:
+            print(f"- 测试样本数: {len(test_loader.dataset)}")
+        print(f"{'='*50}\n")
+
+        with open("training_log.txt", "w") as log_file:
+            log_file.write("Epoch,Train Loss,Val Loss,特征周期 MAE,有义波高 MAE,耗时(秒),预计剩余时间,学习率\n")
+        
+        for epoch in range(self.config.epochs):
+            print(f"\n{'='*30} Epoch {epoch + 1}/{self.config.epochs} {'='*30}")
+            epoch_start = time.time()
+
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"当前学习率: {current_lr:.8f}")
+            
+            train_loss = self.train_epoch(train_loader)
+            val_loss, val_metrics = self.evaluate(val_loader)
+
+            self.scheduler.step(val_loss)
+
+            epoch_end = time.time()
+            epoch_time = epoch_end - epoch_start
+            epoch_times.append(epoch_time)
+
+            avg_epoch_time = sum(epoch_times) / len(epoch_times)
+            remaining_epochs = total_epochs - (epoch + 1)
+            est_remaining_time = avg_epoch_time * remaining_epochs
+
+            hours, remainder = divmod(est_remaining_time, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            time_str = f"{int(hours)}小时 {int(minutes)}分钟 {int(seconds)}秒"
+
+            print(f"\n结果汇总:")
+            print(f"- Train Loss: {train_loss:.6f}")
+            print(f"- Val Loss: {val_loss:.6f}")
+            print(f"- 特征周期 MAE: {val_metrics['特征周期_MAE']:.4f}")
+            print(f"- 有义波高 MAE: {val_metrics['有义波高_MAE']:.4f}")
+            print(f"- 本轮用时: {epoch_time:.2f}秒")
+            print(f"- 预计剩余: {time_str}")
+
+            progress_percent = (epoch + 1) / total_epochs * 100
+            print(f"总进度: {progress_percent:.1f}% [{epoch + 1}/{total_epochs}]")
+
+            if epoch > 0:
+                best_val_loss_str = f"最佳验证损失: {self.best_val_loss:.6f}"
+                if val_loss < self.best_val_loss:
+                    print(f"{best_val_loss_str} → {val_loss:.6f} (改善: {self.best_val_loss - val_loss:.6f})")
+                else:
+                    print(f"{best_val_loss_str} | 当前: {val_loss:.6f} (差距: {val_loss - self.best_val_loss:.6f})")
+
+            with open("training_log.txt", "a") as log_file:
+                log_file.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f},{val_metrics['特征周期_MAE']:.4f},{val_metrics['有义波高_MAE']:.4f},{epoch_time:.2f},{time_str},{current_lr:.8f}\n")
+
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                torch.save(self.model.state_dict(), "best_wave_model.pth")
+                print(f"✓ 模型已保存 (val_loss: {val_loss:.6f})")
+                no_improve = 0
+            else:
+                no_improve += 1
+                print(f"! 模型未改善 ({no_improve}/{patience})")
+
+            if no_improve >= patience:
+                print(f"\n早停: {patience} 轮无改善")
+                break
+            
+            print(f"\n{'-'*70}")
+
+        total_time = time.time() - start_time
+        hours, remainder = divmod(total_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"\n{'='*50}")
+        print(f"训练完成! 总用时: {int(hours)}小时 {int(minutes)}分钟 {int(seconds)}秒")
+        print(f"最佳验证损失: {self.best_val_loss:.6f}")
+        print(f"{'='*50}")
+
+        if test_loader is not None:
+            self.model.load_state_dict(torch.load("best_wave_model.pth"))
+            test_metrics = self.test(test_loader)
+            print("\n测试结果:")
+            print(
+                f"特征周期 MAE: {test_metrics['特征周期_MAE']:.4f}, RMSE: {test_metrics['特征周期_RMSE']:.4f}, R²: {test_metrics['特征周期_R2']:.4f}, MRE: {test_metrics['特征周期_MRE']:.4f}, MSE: {test_metrics['特征周期_MSE']:.4f}")
+            print(
+                f"有义波高 MAE: {test_metrics['有义波高_MAE']:.4f}, RMSE: {test_metrics['有义波高_RMSE']:.4f}, R²: {test_metrics['有义波高_R2']:.4f}, MRE: {test_metrics['有义波高_MRE']:.4f}, MSE: {test_metrics['有义波高_MSE']:.4f}")
+            print(
+                f"总体 MAE: {test_metrics['Overall_MAE']:.4f}, RMSE: {test_metrics['Overall_RMSE']:.4f}, R²: {test_metrics['Overall_R2']:.4f}, MRE: {test_metrics['Overall_MRE']:.4f}, MSE: {test_metrics['Overall_MSE']:.4f}")
+
+        self._save_training_history()
+
+    def _save_training_history(self):
+        history = {
+            "Epoch": list(range(1, len(self.train_losses) + 1)),
+            "Train_Loss": self.train_losses,
+            "Val_Loss": self.val_losses
+        }
+
+        for i, metrics in enumerate(self.val_metrics):
+            for key, value in metrics.items():
+                if key not in history:
+                    history[key] = [None] * len(self.train_losses)
+                history[key][i] = value
+
+        history_df = pd.DataFrame(history)
+        try:
+            history_df.to_excel("wave_model_training_history.xlsx", index=False)
+            print("训练历史已保存到 wave_model_training_history.xlsx")
+        except ImportError:
+            history_df.to_csv("wave_model_training_history.csv", index=False)
+            print("训练历史已保存到 wave_model_training_history.csv")
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(history["Epoch"], history["Train_Loss"], label="训练损失")
+        plt.plot(history["Epoch"], history["Val_Loss"], label="验证损失")
+        plt.xlabel("轮次")
+        plt.ylabel("损失")
+        plt.title("训练和验证损失")
+        plt.legend()
+        plt.savefig("loss_curve.png")
+        plt.close()
+        
+        
+
+    def _save_test_results(self, targets, predictions):
+        targets_denorm = np.zeros_like(targets)
+        preds_denorm = np.zeros_like(predictions)
+
+        for i, name in enumerate(Config.target_names):
+            mean = self.processor.target_stats[name]['mean']
+            std = self.processor.target_stats[name]['std']
+            targets_denorm[:, i] = targets[:, i] * std + mean
+            preds_denorm[:, i] = predictions[:, i] * std + mean
+
+        results = {
+            "样本索引": list(range(1, len(targets) + 1))
+        }
+
+        for i, name in enumerate(Config.target_names):
+            results[f"真实_{name}"] = targets_denorm[:, i]
+            results[f"预测_{name}"] = preds_denorm[:, i]
+            results[f"误差_{name}"] = np.abs(targets_denorm[:, i] - preds_denorm[:, i])
+            results[f"相对误差_{name}"] = np.abs(targets_denorm[:, i] - preds_denorm[:, i]) / (
+                        np.abs(targets_denorm[:, i]) + 1e-3)
+
+        results_df = pd.DataFrame(results)
+        try:
+            results_df.to_excel("wave_model_test_results.xlsx", index=False)
+            print("测试结果已保存到 wave_model_test_results.xlsx")
+        except ImportError:
+            results_df.to_csv("wave_model_test_results.csv", index=False)
+            print("测试结果已保存到 wave_model_test_results.csv")
+
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.scatter(targets_denorm[:, 0], preds_denorm[:, 0], alpha=0.6)
+        plt.plot([min(targets_denorm[:, 0]), max(targets_denorm[:, 0])],
+                 [min(targets_denorm[:, 0]), max(targets_denorm[:, 0])], 'r--')
+        plt.xlabel("真实特征周期")
+        plt.ylabel("预测特征周期")
+        plt.title("特征周期预测散点图")
+
+        plt.subplot(1, 2, 2)
+        plt.scatter(targets_denorm[:, 1], preds_denorm[:, 1], alpha=0.6)
+        plt.plot([min(targets_denorm[:, 1]), max(targets_denorm[:, 1])],
+                 [min(targets_denorm[:, 1]), max(targets_denorm[:, 1])], 'r--')
+        plt.xlabel("真实有义波高")
+        plt.ylabel("预测有义波高")
+        plt.title("有义波高预测散点图")
+
+        plt.tight_layout()
+        plt.savefig("prediction_scatter.png")
+        plt.close()
+
+
+if __name__ == "__main__":
+    print(f"使用设备: {Config.device}")
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    config = Config()
+    processor = WaveDataProcessor()
+
+    print("加载时历数据...")
+    motion_data, wave_data = processor.load_data()
+
+    print(f"时历数据形状: {motion_data.shape}")
+    print(f"波浪参数形状: {wave_data.shape}")
+
+    print("创建数据集...")
+    train_dataset, val_dataset, test_dataset = processor.create_datasets(motion_data, wave_data)
+    print(f"训练集: {len(train_dataset)} 样本")
+    print(f"验证集: {len(val_dataset)} 样本")
+    print(f"测试集: {len(test_dataset)} 样本")
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2)
+
+    model = WaveParameterModel(motion_data_dim=Config.sequence_length)
+    print(f"模型参数总数: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
+    try:
+        from torchinfo import summary
+        sample_cnn = torch.zeros(1, 1, 224, 224)
+        sample_lstm = torch.zeros(1, Config.sequence_length)
+
+        print("\n模型结构摘要:")
+        summary(model, input_data=[sample_cnn, sample_lstm])
+    except ImportError:
+        print("未安装torchinfo模块，跳过模型摘要打印。如需查看模型结构，请安装torchinfo: pip install torchinfo")
+    except Exception as e:
+        print(f"打印模型摘要时出错: {e}")
+
+    trainer = Trainer(model, config, processor)
+
+    trainer.train(train_loader, val_loader, test_loader)
+
+    print("程序完成!")
