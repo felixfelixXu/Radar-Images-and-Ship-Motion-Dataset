@@ -121,3 +121,5 @@ The model is a dual-branch fusion network: a CNN-based branch for radar imagery 
 The code is modular: you can swap encoders, adjust attention modules, or change fusion strategies by editing the corresponding classes.
 
 Data splits are deterministic (index-based) to ensure reproducibility of training/validation/test partitions.
+# **///////////////Regarding the Generalization verification dataset//////////////**
+We have uploaded the generalization verification dataset.It is available at https://drive.google.com/drive/folders/1QLRPG9VhX9duRuKjeeBL2JSZFnIA9VAL?usp=drive_link.
