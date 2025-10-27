@@ -1,8 +1,8 @@
 # Ship-motion-and-Radar-images-dataset
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15735441.svg)](https://doi.org/10.5281/zenodo.15735441)
-# **///////////////Regarding the dataset division//////////////**
+# **Regarding the dataset division**
 We have completed the dataset division.It is available at https://drive.google.com/drive/folders/1_ANAyuis2NLfTWKMzmDq7XzSbXjrTtVG?usp=drive_link.
-# **///////////////Regarding the code files//////////////**
+# **Regarding the code files**
 We uploaded our complete code to the repository, and the file name was "Code".
 # Wave Parameter Inversion Model: Code and Dataset
 
@@ -121,5 +121,5 @@ The model is a dual-branch fusion network: a CNN-based branch for radar imagery 
 The code is modular: you can swap encoders, adjust attention modules, or change fusion strategies by editing the corresponding classes.
 
 Data splits are deterministic (index-based) to ensure reproducibility of training/validation/test partitions.
-# **///////////////Regarding the Generalization verification dataset//////////////**
+# **Regarding the Generalization verification dataset**
 We have uploaded the generalization verification dataset.It is available at https://drive.google.com/drive/folders/1QLRPG9VhX9duRuKjeeBL2JSZFnIA9VAL?usp=drive_link.
